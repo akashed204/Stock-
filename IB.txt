@@ -1,0 +1,83 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © brocapital
+
+//@version=4
+study(title="Initial Balance Range Extension", shorttitle="IB Range Extension", overlay=true)
+
+//Session Rules
+Offset = input(true, title="OFFSET")
+
+IBRange = input(true, title="IB Range", group = "IB Range",  inline="1")
+IBmindline = input(true, title="IB Range midline", group = "IB Range",  inline="2")
+IBRange80 = input(true, title="80%", group = "Range Extension",  inline="2")
+IBRange100 = input(true, title="100%", group = "Range Extension",  inline="2")
+IBRange200 = input(true, title="200%", group = "Range Extension",  inline="2")
+IBRange300 = input(false, title="300%", group = "Range Extension",  inline="2")
+
+colIB = input(color.new(#008aff, 0),     "", inline='x3', group="IB Range", type=input.color, inline = "1")
+colRange = input(color.new(#ffac5a, 0),     "", inline='x3', group="Range Extension", type=input.color, inline = "2")
+colIBmidLine = input(color.new(#01cb1d, 0),     "", inline='x3', group="IB Range", type=input.color, inline = "2")
+atrLength = input(14, title="ATR Length", minval=1, group="IB Classification")
+showSessionStartIBLabel = input(true, title="Show Day Start IB Label", group="IB Classification")
+
+bartimeSess = time('D')
+newbarSess = bartimeSess != bartimeSess[1]
+high_range = valuewhen(newbarSess,high,0)
+low_range = valuewhen(newbarSess,low,0)
+
+//Calcul For Opening Range
+locHigh = security(syminfo.tickerid, "60", high_range)
+locLow = security(syminfo.tickerid, "60", low_range)
+range = locHigh - locLow
+// ATR is calculated from Daily timeframe using Wilder's RMA (14 days by default)
+atrValue = security(syminfo.tickerid, "D", rma(max(high - low, max(abs(high - close[1]), abs(low - close[1]))), atrLength), lookahead=false)
+
+classify_ib(_ibRange, _atr) =>
+    na(_ibRange) or na(_atr) or _atr <= 0 ? "" :
+     _ibRange < 0.5 * _atr ? "Small IB" :
+     _ibRange <= 1.5 * _atr ? "Normal IB" :
+     "Wide IB"
+
+ibLabelText = classify_ib(range, atrValue)
+
+//Plot Statements For Initial Balance
+IBColor = range != range[1] ? na : colIB
+
+d_shift = timeframe.period == '1' ? -59 :
+         timeframe.period == '3' ? -19 :
+         timeframe.period == '5' ? -11 :
+         timeframe.period == '15' ? -3 :
+         timeframe.period == '30' ? -1 :
+         0
+         
+_offset = Offset ? d_shift : na  
+
+var table todayIbTable = table.new(position.top_right, 1, 1, border_width=1)
+if barstate.islast
+    if ibLabelText != ""
+        table.cell(todayIbTable, 0, 0, "Today IB: " + ibLabelText, text_color=color.white, bgcolor=color.new(#008aff, 0), text_size=size.normal)
+    else
+        table.cell(todayIbTable, 0, 0, "", text_color=color.white, bgcolor=color.new(color.black, 100), text_size=size.normal)
+
+if showSessionStartIBLabel and newbarSess and ibLabelText != ""
+    label.new(bar_index, locHigh, text=ibLabelText, style=label.style_label_down, color=color.new(#008aff, 0), textcolor=color.white, size=size.small)
+
+ibH = plot((time(timeframe.period) > 0) and IBRange ? locHigh : na,title="IB High", color=IBColor, transp=20, linewidth=1, offset=_offset)
+ibL = plot((time(timeframe.period) > 0) and IBRange ? locLow : na,title="IB Low", color=IBColor, transp=20, linewidth=1, offset=_offset)
+
+//Plot Statements For Medium of IB range
+IBmidColor = range != range[1] ? na : colIBmidLine
+plot(IBmindline? locLow + range/2 : na,title="IB Medium", color=IBmidColor, transp=50, linewidth=1, offset=_offset)
+
+//Plot Statements For Higher extensions(x1, x2 and x3)
+IBExtenColor = range != range[1] ? na : colRange
+plot(IBRange80 ? locHigh + (0.8*range) : na,title="IB High Extension(80%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset, style = plot.style_cross)
+plot(IBRange100 ? locHigh + range : na,title="IB High Extension(100%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
+plot(IBRange200 ? locHigh + (2*range) : na,title="IB High Extension(200%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
+plot(IBRange300 ? locHigh + (3*range) : na,title="IB High Extension(300%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
+
+//Plot Statements For Lower extensions(x1, x2 and x3)
+plot(IBRange80 ? locLow - (0.8*range) : na,title="IB Low Extension(80%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset,  style = plot.style_cross)
+plot(IBRange100 ? locLow - range : na,title="IB Low Extension(100%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
+plot(IBRange200 ? locLow - (2*range) : na,title="IB Low Extension(200%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
+plot(IBRange300 ? locLow - (3*range) : na,title="IB Low Extension(300%)", color=IBExtenColor, transp=50, linewidth=1, offset=_offset)
