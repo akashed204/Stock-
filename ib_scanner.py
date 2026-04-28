@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytz
@@ -114,8 +116,8 @@ class IBResult:
     ib_high: float
     ib_low: float
     ib_range: float
-    atr: float
-    ib_type: str
+    atr: float = 0.0
+    ib_type: str = ""
 
 
 def ist_now() -> datetime:
@@ -137,6 +139,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional CSV file path to export results",
     )
+    parser.add_argument(
+        "--daily-csv",
+        default=None,
+        help="Optional path to a CSV file containing historical daily candles."
+    )
+    parser.add_argument(
+        "--intraday-csv",
+        default=None,
+        help="Optional path to a CSV file containing intraday 1-minute candles."
+    )
     return parser.parse_args()
 
 
@@ -144,6 +156,33 @@ def create_client(username: str, api_key: str) -> Aliceblue:
     # Common pya3 login signature.
     # If your version differs, adapt this method accordingly.
     return Aliceblue(user_id=username, api_key=api_key)
+
+
+def is_session_valid(client: Aliceblue) -> bool:
+    """Lightweight API sanity check before starting a scan."""
+    try:
+        get_session_id = getattr(client, "get_session_id", None)
+        if callable(get_session_id):
+            session_id = get_session_id()
+            if not session_id:
+                print("[ERROR] Alice Blue session is invalid or expired")
+                return False
+
+        time.sleep(0.3)
+        instrument = client.get_instrument_by_symbol("NSE", "SBIN")
+        if instrument is None:
+            print("[ERROR] Alice Blue API session check failed")
+            return False
+        return True
+    except JSONDecodeError:
+        print("API returned empty response")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        if "JSONDecodeError" in type(exc).__name__:
+            print("API returned empty response")
+        else:
+            print(f"[ERROR] Alice Blue session check failed: {type(exc).__name__}: {exc}")
+        return False
 
 
 def get_session_times() -> Tuple[datetime, datetime, datetime, datetime]:
@@ -233,32 +272,155 @@ def safe_get_historical(
     """
     Fetch candles and normalize response across possible pya3 variants.
     """
-    # Most common pya3 method signature
-    # Many clients expect naive datetime values for market local wall-clock.
-    api_start = start.replace(tzinfo=None) if isinstance(start, datetime) and start.tzinfo else start
-    api_end = end.replace(tzinfo=None) if isinstance(end, datetime) and end.tzinfo else end
+    api_start = start
+    api_end = end
 
-    response = client.get_historical(
-        instrument,
-        api_start,
-        api_end,
-        interval,
-    )
+    response: Any = None
+    for attempt in range(1, 4):
+        try:
+            time.sleep(0.3)
+            response = client.get_historical(
+                instrument,
+                api_start,
+                api_end,
+                interval,
+            )
+            break
+        except JSONDecodeError:
+            print("API returned empty response")
+        except Exception as e:
+            if "JSONDecodeError" in type(e).__name__:
+                print("API returned empty response")
+            else:
+                print(
+                    f"[API ERROR] get_historical failed "
+                    f"(attempt {attempt}/3): {type(e).__name__}: {str(e)[:100]}"
+                )
+
+        if attempt < 3:
+            time.sleep(1)
+    else:
+        return []
 
     if isinstance(response, dict):
-        # Some versions return {'status': 'success', 'data': [...]} etc.
-        data = response.get("data", [])
+        # pya3 can return {'stat': 'Not_Ok', ...} on API-side errors.
+        status = str(response.get("status") or response.get("stat") or "").lower()
+        if status and status not in {"success", "ok", "true"}:
+            print(f"[API ERROR] Invalid historical response status: {response.get('status') or response.get('stat')}")
+            return []
+        data = response.get("data") or response.get("candles") or response.get("result") or []
     elif isinstance(response, list):
         data = response
+    elif hasattr(response, "to_dict"):
+        try:
+            data = response.to_dict("records")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[API ERROR] Could not parse historical dataframe: {type(exc).__name__}: {exc}")
+            return []
     else:
-        data = []
+        return []
+
+    if not isinstance(data, list) or not data:
+        return []
 
     parsed: List[Dict[str, Any]] = []
     for row in data:
         c = parse_candle(row)
         if c is not None:
             parsed.append(c)
+
+    if not parsed:
+        return []
     return parsed
+
+
+def load_csv_candles(path: str, key_field: str = "symbol") -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load a CSV of candles into a mapping: symbol -> list of candle dicts.
+
+    Expected CSV columns: symbol, timestamp, open, high, low, close, [volume]
+    Timestamp parsing uses parse_timestamp.
+    """
+    mapping: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sym = row.get(key_field) or row.get("symbol")
+                if not sym:
+                    continue
+                ts_raw = row.get("timestamp") or row.get("time")
+                ts = parse_timestamp(ts_raw)
+                if ts is None:
+                    continue
+                try:
+                    o = float(row.get("open"))
+                    h = float(row.get("high"))
+                    l = float(row.get("low"))
+                    c = float(row.get("close"))
+                except (TypeError, ValueError):
+                    continue
+
+                candle = {"timestamp": ts, "open": o, "high": h, "low": l, "close": c}
+                mapping.setdefault(sym.strip().upper(), []).append(candle)
+    except FileNotFoundError:
+        print(f"[WARN] CSV not found: {path}")
+    return mapping
+
+
+def fetch_yfinance_intraday(symbol: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """
+    Fallback 1-minute NSE intraday candles using Yahoo Finance.
+
+    This is only used when Alice Blue historical data returns no usable candles.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("[WARN] yfinance is not installed; fallback intraday source skipped")
+        return []
+
+    ticker = f"{symbol.strip().upper()}.NS"
+    try:
+        time.sleep(0.3)
+        df = yf.download(
+            ticker,
+            period="1d",
+            interval="1m",
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] {symbol}: yfinance fallback failed: {type(exc).__name__}: {exc}")
+        return []
+
+    if df is None or df.empty:
+        return []
+
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = [col[0] for col in df.columns]
+
+    candles: List[Dict[str, Any]] = []
+    for ts, row in df.iterrows():
+        parsed_ts = parse_timestamp(ts)
+        if parsed_ts is None or not (start <= parsed_ts < end):
+            continue
+
+        try:
+            candles.append(
+                {
+                    "timestamp": parsed_ts,
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return candles
 
 
 def compute_ib_range(
@@ -366,15 +528,15 @@ def compute_atr_14(daily_candles: Sequence[Dict[str, Any]], symbol: str = "UNKNO
     return atr
 
 
-def classify_ib(ib_range: Optional[float], atr: Optional[float]) -> Optional[str]:
+def classify_ib(ib_range: Optional[float]) -> Optional[str]:
+    """Classify IB based on range alone (no ATR)."""
     if ib_range is None:
         return None
-    if atr is None or atr <= 0:
-        return None
 
-    if ib_range < 0.5 * atr:
+    # Simple classification: < 50 = Small, 50-200 = Normal, > 200 = Wide
+    if ib_range < 50:
         return "Small IB"
-    if ib_range <= 1.5 * atr:
+    if ib_range <= 200:
         return "Normal IB"
     return "Wide IB"
 
@@ -386,30 +548,57 @@ def scan_symbol(
     ib_end: datetime,
     daily_start: datetime,
     daily_end: datetime,
+    intraday_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    daily_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[IBResult]:
     try:
         current_time = ist_now()
         if current_time < ib_end:
             return None
 
-        instrument = client.get_instrument_by_symbol("NSE", symbol)
-        intraday = safe_get_historical(client, instrument, market_open, current_time, "1")
-        daily = safe_get_historical(client, instrument, daily_start, daily_end, "D")
+        symbol_key = symbol.strip().upper()
 
-        if not intraday or not daily:
+        # Step 1: Get instrument
+        time.sleep(0.3)
+        instrument = client.get_instrument_by_symbol("NSE", symbol)
+        if instrument is None:
+            print(f"[ERROR] {symbol}: Instrument not found in NSE")
             return None
 
+        # Step 2: Fetch only 1-minute intraday candles from IB window
+        if intraday_map is not None:
+            intraday = intraday_map.get(symbol_key, [])
+        else:
+            intraday = safe_get_historical(client, instrument, market_open, ib_end, "1")
+            if not intraday:
+                print(f"[WARN] {symbol}: Alice Blue returned no intraday candles; trying yfinance fallback")
+                intraday = fetch_yfinance_intraday(symbol, market_open, ib_end)
+
+        if not isinstance(intraday, list) or not intraday:
+            print(f"[ERROR] {symbol}: No intraday candles returned (time range: {market_open} to {ib_end})")
+            return None
+
+        # Step 3: Compute IB range only (no ATR needed)
         ib_data = compute_ib_range(intraday, market_open, ib_end)
-        atr = compute_atr_14(daily)
 
         if ib_data is None:
+            print(f"[ERROR] {symbol}: Could not compute IB range from {len(intraday)} intraday candles")
             return None
 
         ib_range, ib_high, ib_low = ib_data
-        ib_type = classify_ib(ib_range, atr)
+
+        # Step 4: Classify IB based on range alone
+        ib_type = classify_ib(ib_range)
         if ib_type is None:
+            print(f"[ERROR] {symbol}: Classification failed for range={ib_range:.2f}")
             return None
 
+        atr = 0.0
+        if daily_map is not None:
+            daily = daily_map.get(symbol_key, [])
+            atr = compute_atr_14(daily, symbol) or 0.0
+
+        print(f"[OK] {symbol}: {ib_type} (range={ib_range:.2f})")
         return IBResult(
             symbol=symbol,
             ib_high=ib_high,
@@ -418,8 +607,16 @@ def scan_symbol(
             atr=atr,
             ib_type=ib_type,
         )
+    except JSONDecodeError:
+        print("API returned empty response")
+        return None
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] {symbol}: {exc}")
+        if "JSONDecodeError" in type(exc).__name__:
+            print("API returned empty response")
+            return None
+        print(f"[EXCEPTION] {symbol}: {type(exc).__name__}: {exc}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -490,7 +687,20 @@ def main() -> None:
     print("Scanning symbols...")
     results: List[IBResult] = []
 
-    with ThreadPoolExecutor(max_workers=min(16, max(4, len(args.symbols)))) as executor:
+    if not is_session_valid(client):
+        print("Scan stopped: Alice Blue API session is not valid.")
+        return
+
+    intraday_map: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    daily_map: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    if args.intraday_csv:
+        intraday_map = load_csv_candles(args.intraday_csv)
+        print(f"Loaded intraday CSV for {len(intraday_map)} symbols")
+    if args.daily_csv:
+        daily_map = load_csv_candles(args.daily_csv)
+        print(f"Loaded daily CSV for {len(daily_map)} symbols")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
             executor.submit(
                 scan_symbol,
@@ -500,6 +710,8 @@ def main() -> None:
                 ib_end,
                 daily_start,
                 daily_end,
+                intraday_map,
+                daily_map,
             ): symbol
             for symbol in args.symbols
         }
@@ -509,8 +721,7 @@ def main() -> None:
             if out is not None:
                 results.append(out)
 
-    # Sort by IB range relative to ATR (smallest first)
-    results.sort(key=lambda x: x.ib_range / x.atr)
+    results.sort(key=lambda x: x.ib_range)
     print_results(results, highlight_small=True)
 
     if args.export_csv:
